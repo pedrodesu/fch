@@ -48,6 +48,9 @@ fn memory(allocator: std.mem.Allocator) !std.meta.Tuple(&.{ u64, u64 }) {
         const k = property_it.next().?;
         const v = property_it.next().?;
         try kv.put(k, v);
+
+        if (kv.contains("MemAvailable") and kv.contains("MemTotal"))
+            break;
     }
 
     return .{ try std.fmt.parseInt(u64, kv.get("MemAvailable").?, 10) / 1024, try std.fmt.parseInt(u64, kv.get("MemTotal").?, 10) / 1024 };
@@ -58,9 +61,8 @@ fn space() !std.meta.Tuple(&.{ f64, f64 }) {
 
     const res = std.posix.errno(c.statvfs("/", &stats));
 
-    if (res != .SUCCESS) {
+    if (res != .SUCCESS)
         return std.posix.unexpectedErrno(res);
-    }
 
     const total_disk = @as(f64, @floatFromInt(stats.f_blocks * stats.f_bsize)) / 1_000_000_000;
     const rem_disk = @as(f64, @floatFromInt(stats.f_bavail * stats.f_bsize)) / 1_000_000_000;
@@ -90,14 +92,37 @@ fn cpu(allocator: std.mem.Allocator) !std.meta.Tuple(&.{ []u8, []u8 }) {
     while (try reader.readUntilDelimiterOrEofAlloc(arena.allocator(), '\n', 4096)) |line| {
         var property_it = std.mem.splitScalar(u8, line, ':');
         const k = std.mem.trimRight(u8, property_it.next().?, &std.ascii.whitespace);
-        const v = std.mem.trimLeft(u8, property_it.next() orelse break, &std.ascii.whitespace);
+        const v = std.mem.trimLeft(u8, property_it.next() orelse continue, &std.ascii.whitespace);
         try kv.put(k, v);
+
+        if (kv.contains("model name") and kv.contains("cpu cores"))
+            break;
     }
 
     return .{ try allocator.dupe(u8, kv.get("model name").?), try allocator.dupe(u8, kv.get("cpu cores").?) };
 }
 
+fn gpu(allocator: std.mem.Allocator) !?[]const u8 {
+    const lspci = try std.ChildProcess.run(.{ .allocator = allocator, .argv = &[_][]const u8{"lspci"} });
+    defer allocator.free(lspci.stderr);
+    defer allocator.free(lspci.stdout);
+
+    var it = std.mem.splitScalar(u8, lspci.stdout, '\n');
+    while (it.next()) |l| {
+        if (std.mem.count(u8, l, "VGA") == 1) {
+            const left_bound = std.mem.indexOfScalarPos(u8, l, 8, ':').? + 2;
+            const right_bound = std.mem.lastIndexOfScalar(u8, l, '(').? - 1;
+            return try allocator.dupe(u8, l[left_bound..right_bound]);
+        }
+    }
+
+    return null;
+}
+
 const ANSI_TITLE = "\x1b[1;38;2;112;103;207m";
+const ANSI_FIELD = "\x1b[0;38;2;141;133;217m";
+const ANSI_GRAY = "\x1b[0;38;2;85;85;85m";
+const ANSI_ORANGE = "\x1b[0;38;2;255;127;0m";
 const ANSI_RESET = "\x1b[0m";
 
 pub fn main() !void {
@@ -121,9 +146,8 @@ pub fn main() !void {
     defer gpa.allocator().free(cpu_info.@"0");
     defer gpa.allocator().free(cpu_info.@"1");
 
-    const stdout_file = std.io.getStdOut().writer();
-    var bw = std.io.bufferedWriter(stdout_file);
-    const stdout = bw.writer();
+    const gpu_model = try gpu(gpa.allocator()) orelse "none";
+    defer gpa.allocator().free(gpu_model);
 
     const uptime_raw = uptime();
     const uptime_format = try if (uptime_raw < 60)
@@ -134,17 +158,63 @@ pub fn main() !void {
         std.fmt.allocPrint(gpa.allocator(), "{}h {}m {}s", .{ uptime_raw / 60 / 60, uptime_raw / 60 % 60, uptime_raw % 60 });
     defer gpa.allocator().free(uptime_format);
 
+    const stdout_file = std.io.getStdOut().writer();
+    var bw = std.io.bufferedWriter(stdout_file);
+    const stdout = bw.writer();
+
     try stdout.print(
         \\
-        \\       ___      {s}
-        \\      (.· |     os          {s}
-        \\      (<> |     kernel      {s}
-        \\     / __  \    memory      {}M / {}M
-        \\    ( /  \ /|   disk        {d:.1}G / {d:.1}G
-        \\  _/\ __)/_)    cpu         {s} * {s}
-        \\  \/-____\/     uptime      {s}
+        \\                  {s}
+        \\       
+    ++ ANSI_GRAY ++ "___" ++ ANSI_RESET ++
+        \\        
+    ++ ANSI_FIELD ++ "os" ++ ANSI_RESET ++
+        \\          {s}
+        \\      
+    ++ ANSI_GRAY ++ "(" ++ ANSI_RESET ++
+        \\.· 
+    ++ ANSI_GRAY ++ "|" ++ ANSI_RESET ++
+        \\       
+    ++ ANSI_FIELD ++ "kernel" ++ ANSI_RESET ++
+        \\      {s}
+        \\      
+    ++ ANSI_GRAY ++ "(" ++ ANSI_RESET ++ ANSI_ORANGE ++ "<>" ++ ANSI_RESET ++
+        \\ 
+    ++ ANSI_GRAY ++ "|" ++ ANSI_RESET ++
+        \\       
+    ++ ANSI_FIELD ++ "memory" ++ ANSI_RESET ++
+        \\      {}M / {}M
+        \\     
+    ++ ANSI_GRAY ++ "/" ++ ANSI_RESET ++
+        \\ __  
+    ++ ANSI_GRAY ++ "\\" ++ ANSI_RESET ++
+        \\      
+    ++ ANSI_FIELD ++ "disk" ++ ANSI_RESET ++
+        \\        {d:.1}G / {d:.1}G
+        \\    
+    ++ ANSI_GRAY ++ "(" ++ ANSI_RESET ++
+        \\ /  \ 
+    ++ ANSI_GRAY ++ "/|" ++ ANSI_RESET ++
+        \\     
+    ++ ANSI_FIELD ++ "cpu" ++ ANSI_RESET ++
+        \\         {s} × {s}
+        \\  
+    ++ ANSI_ORANGE ++ "_" ++ ANSI_GRAY ++ "/\\" ++ ANSI_RESET ++
+        \\ __)
+    ++ ANSI_GRAY ++ "/" ++ ANSI_ORANGE ++ "_" ++ ANSI_GRAY ++ ")" ++ ANSI_RESET ++
+        \\      
+    ++ ANSI_FIELD ++ "gpu" ++ ANSI_RESET ++
+        \\         {s}
+        \\  
+    ++ ANSI_ORANGE ++ "\\/" ++
+        ANSI_GRAY ++ "-____" ++
+        ANSI_ORANGE ++ "\\/" ++ ANSI_RESET ++
+        \\       
+    ++ ANSI_FIELD ++ "uptime" ++ ANSI_RESET ++
+        \\      {s}
         \\
         \\
-    , .{ head, os, kernel, mem.@"0", mem.@"1", disk.@"0", disk.@"1", cpu_info.@"0", cpu_info.@"1", uptime_format });
+        \\
+    , .{ head, os, kernel, mem.@"0", mem.@"1", disk.@"0", disk.@"1", cpu_info.@"0", cpu_info.@"1", gpu_model, uptime_format });
     try bw.flush();
 }

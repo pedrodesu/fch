@@ -1,1 +1,1 @@
-`neofetch` and its family was archived so I did this little tool for my personal use
+`neofetch` and its family was archived so I did this little tool for my personal use. display heavily inspired on `pfetch`

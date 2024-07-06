@@ -19,14 +19,18 @@ fn name(allocator: std.mem.Allocator) ![]const u8 {
     while (try reader.readUntilDelimiterOrEofAlloc(arena.allocator(), '\n', 4096)) |line| {
         if (line.len == 0)
             continue;
+
         var property_it = std.mem.tokenizeScalar(u8, line, '=');
         const k = property_it.next().?;
         const v = property_it.next().?;
         try kv.put(k, v);
+
+        if (kv.get("PRETTY_NAME")) |pretty_name| {
+            return try allocator.dupe(u8, pretty_name[1 .. pretty_name.len - 1]);
+        }
     }
 
-    const value = kv.get("PRETTY_NAME").?;
-    return try allocator.dupe(u8, value[1 .. value.len - 1]);
+    unreachable;
 }
 
 fn memory(allocator: std.mem.Allocator) !std.meta.Tuple(&.{ u64, u64 }) {
@@ -49,11 +53,14 @@ fn memory(allocator: std.mem.Allocator) !std.meta.Tuple(&.{ u64, u64 }) {
         const v = property_it.next().?;
         try kv.put(k, v);
 
-        if (kv.contains("MemAvailable") and kv.contains("MemTotal"))
-            break;
+        if (kv.get("MemAvailable")) |available| {
+            if (kv.get("MemTotal")) |total| {
+                return .{ try std.fmt.parseInt(u64, available, 10) / 1024, try std.fmt.parseInt(u64, total, 10) / 1024 };
+            }
+        }
     }
 
-    return .{ try std.fmt.parseInt(u64, kv.get("MemAvailable").?, 10) / 1024, try std.fmt.parseInt(u64, kv.get("MemTotal").?, 10) / 1024 };
+    unreachable;
 }
 
 fn space() !std.meta.Tuple(&.{ f64, f64 }) {
@@ -65,7 +72,7 @@ fn space() !std.meta.Tuple(&.{ f64, f64 }) {
         return std.posix.unexpectedErrno(res);
 
     const total_disk = @as(f64, @floatFromInt(stats.f_blocks * stats.f_bsize)) / 1_000_000_000;
-    const rem_disk = @as(f64, @floatFromInt(stats.f_bavail * stats.f_bsize)) / 1_000_000_000;
+    const rem_disk = @as(f64, @floatFromInt(stats.f_bfree * stats.f_bsize)) / 1_000_000_000;
 
     return .{ rem_disk, total_disk };
 }
@@ -95,15 +102,18 @@ fn cpu(allocator: std.mem.Allocator) !std.meta.Tuple(&.{ []u8, []u8 }) {
         const v = std.mem.trimLeft(u8, property_it.next() orelse continue, &std.ascii.whitespace);
         try kv.put(k, v);
 
-        if (kv.contains("model name") and kv.contains("cpu cores"))
-            break;
+        if (kv.get("model name")) |cpu_model| {
+            if (kv.get("cpu cores")) |cpu_cores| {
+                return .{ try allocator.dupe(u8, cpu_model), try allocator.dupe(u8, cpu_cores) };
+            }
+        }
     }
 
-    return .{ try allocator.dupe(u8, kv.get("model name").?), try allocator.dupe(u8, kv.get("cpu cores").?) };
+    unreachable;
 }
 
 fn gpu(allocator: std.mem.Allocator) !?[]const u8 {
-    const lspci = try std.ChildProcess.run(.{ .allocator = allocator, .argv = &[_][]const u8{"lspci"} });
+    const lspci = try std.process.Child.run(.{ .allocator = allocator, .argv = &[_][]const u8{"lspci"} });
     defer allocator.free(lspci.stderr);
     defer allocator.free(lspci.stdout);
 
@@ -112,6 +122,7 @@ fn gpu(allocator: std.mem.Allocator) !?[]const u8 {
         if (std.mem.count(u8, l, "VGA") == 1) {
             const left_bound = std.mem.indexOfScalarPos(u8, l, 8, ':').? + 2;
             const right_bound = std.mem.lastIndexOfScalar(u8, l, '(').? - 1;
+
             return try allocator.dupe(u8, l[left_bound..right_bound]);
         }
     }
@@ -132,31 +143,33 @@ pub fn main() !void {
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    const head = try std.fmt.allocPrint(gpa.allocator(), ANSI_TITLE ++ "{s}" ++ ANSI_RESET ++ "@" ++ ANSI_TITLE ++ "{s}" ++ ANSI_RESET, .{ user, host });
-    defer gpa.allocator().free(head);
+    const allocator = gpa.allocator();
 
-    const os = try name(gpa.allocator());
-    defer gpa.allocator().free(os);
+    const head = try std.fmt.allocPrint(allocator, ANSI_TITLE ++ "{s}" ++ ANSI_RESET ++ "@" ++ ANSI_TITLE ++ "{s}" ++ ANSI_RESET, .{ user, host });
+    defer allocator.free(head);
+
+    const os = try name(allocator);
+    defer allocator.free(os);
 
     const kernel = std.posix.uname().release;
-    const mem = try memory(gpa.allocator());
+    const mem = try memory(allocator);
     const disk = try space();
 
-    const cpu_info = try cpu(gpa.allocator());
-    defer gpa.allocator().free(cpu_info.@"0");
-    defer gpa.allocator().free(cpu_info.@"1");
+    const cpu_info = try cpu(allocator);
+    defer allocator.free(cpu_info.@"0");
+    defer allocator.free(cpu_info.@"1");
 
-    const gpu_model = try gpu(gpa.allocator()) orelse "none";
-    defer gpa.allocator().free(gpu_model);
+    const gpu_model = try gpu(allocator) orelse try allocator.dupe(u8, "none");
+    defer allocator.free(gpu_model);
 
     const uptime_raw = uptime();
     const uptime_format = try if (uptime_raw < 60)
-        std.fmt.allocPrint(gpa.allocator(), "{}s", .{uptime_raw})
+        std.fmt.allocPrint(allocator, "{}s", .{uptime_raw})
     else if (uptime_raw < 60 * 60)
-        std.fmt.allocPrint(gpa.allocator(), "{}m {}s", .{ uptime_raw / 60, uptime_raw % 60 })
+        std.fmt.allocPrint(allocator, "{}m {}s", .{ uptime_raw / 60, uptime_raw % 60 })
     else
-        std.fmt.allocPrint(gpa.allocator(), "{}h {}m {}s", .{ uptime_raw / 60 / 60, uptime_raw / 60 % 60, uptime_raw % 60 });
-    defer gpa.allocator().free(uptime_format);
+        std.fmt.allocPrint(allocator, "{}h {}m {}s", .{ uptime_raw / 60 / 60, uptime_raw / 60 % 60, uptime_raw % 60 });
+    defer allocator.free(uptime_format);
 
     const stdout_file = std.io.getStdOut().writer();
     var bw = std.io.bufferedWriter(stdout_file);
@@ -218,3 +231,5 @@ pub fn main() !void {
     , .{ head, os, kernel, mem.@"0", mem.@"1", disk.@"0", disk.@"1", cpu_info.@"0", cpu_info.@"1", gpu_model, uptime_format });
     try bw.flush();
 }
+
+// TODO add toml config
